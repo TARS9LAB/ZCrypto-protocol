@@ -1,17 +1,14 @@
 # ZCrypto-protocol
 ZCrypto protocol
 
+zcnft.sol                IRONMAN，FREE BIRD NFT
 
-PrivateSale.sol          私募合约
+nationTreasury.sol       DA
 
-zcnft.sol                钢铁侠，自由鸟 两个NFT
+zcfund.sol               ZC fund
 
-nationTreasury.sol       DAO国库合约
+withdrawalContract.sol   withdraw
 
-zcfund.sol               ZC 基金合约
+zcToken.sol              ZC TOKEN
 
-withdrawalContract.sol   存款提现合约
-
-zcToken.sol              ZC 代币合约
-
-randomSeedUtil.sol       VRF随机数合约
+randomSeedUtil.sol       VRF RANDOM NUMBER
