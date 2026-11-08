@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
-
 /// @title ZCrypto V6 会话密钥管理合约（草稿）
 /// @notice 主钱包每次仅授权一把有效下注密钥，新授权立即替换旧密钥。
 /// @dev 不管理资金、存取款、佣金或 GuessAccount 余额。
@@ -14,7 +13,8 @@ contract ZCryptoSessionManagerV6 {
     error InvalidExpiry();
     error NoActiveSession();
     error AllowanceExceeded();
-    error AlreadyCommitted();
+    error BetNonceUsed();
+    error EmptyBatch();
     error ZeroAmount();
     uint256 public constant DEFAULT_LIMIT = 10 ether; // 默认累计下注额度为 10 USDZ（18 位小数）
     uint64 public constant MAX_SESSION_DURATION = 1 days;
@@ -23,6 +23,9 @@ contract ZCryptoSessionManagerV6 {
     );
     bytes32 public constant REVOKE_TYPEHASH = keccak256(
         "RevokeSession(address user,uint256 nonce,uint64 deadline)"
+    );
+    bytes32 public constant BET_TYPEHASH = keccak256(
+        "SessionBet(address user,uint256 roundId,uint64 guess,uint256 amount,uint256 betNonce,uint256 generation)"
     );
     bytes32 private constant DOMAIN_TYPEHASH = keccak256(
         "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
@@ -42,14 +45,14 @@ contract ZCryptoSessionManagerV6 {
     mapping(address => Session) private _sessions;
     mapping(address => uint256) public nonces;
 
-    // 每用户每轮只能累计扣除一次额度；更换密钥也不能重复提交。
-    mapping(address => mapping(uint256 => bool)) public roundCommitted;
+    // 下注Nonce与主钱包授权Nonce独立；Bitmap每256个Nonce使用一个存储槽。
+    mapping(address => mapping(uint256 => uint256)) private _betNonceBitmap;
     event SessionRegistered(address indexed user, address indexed key, uint256 generation,
         uint256 limit, uint64 expiry);
     event SessionRevoked(address indexed user, uint256 generation);
-    event AllowanceConsumed(address indexed user, address indexed key, uint256 indexed roundId,
-        uint256 amount, uint256 spent);
-    
+    event BetConsumed(address indexed user, address indexed key, uint256 indexed roundId,
+        uint256 betNonce, uint256 amount, uint256 spent);
+
     /// @notice 部署时绑定唯一竞猜合约，只有该合约能消费下注授权额度。
     constructor(address engine) {
         if (engine == address(0)) revert InvalidAddress();
@@ -132,29 +135,68 @@ contract ZCryptoSessionManagerV6 {
         return key != address(0) && s.key == key && block.timestamp <= s.expiry;
     }
 
-    /// @notice 验证竞猜合约构造的下注签名摘要是否由当前有效密钥签署。
-    /// @dev 仅验证密钥身份与有效期，不验证下注 Nonce、轮次、价格或余额。
-    function verifySessionSignature(
-        address user, bytes32 betDigest, bytes calldata signature
-    ) external view returns (bool) {
-        address signer = _recover(betDigest, signature);
-        return isActive(user, signer);
+    /// @notice 查询用户指定下注Nonce是否已经使用，供RELAY和竞猜合约读取。
+    /// @dev 每256个Nonce共用一个位图，Nonce被使用后不可重新使用，包括更换Session Key后。
+    function isBetNonceUsed(address user, uint256 betNonce) public view returns (bool) {
+        uint256 mask = uint256(1) << (betNonce & 255);
+        return (_betNonceBitmap[user][betNonce >> 8] & mask) != 0;
     }
 
-    /// @notice 只有竞猜合约可以在核验下注后扣减累计授权额度。
-    /// @dev 每用户每轮仅能消费一次；超出授权额度则拒绝。
-    /// @dev 竞猜合约必须自行验证下注签名、资格和轮次状态。
-    /// @dev 本函数不更新 GuessAccount，也不验证下注是否属于 BetRoot。
-    function consumeForRound(address user, uint256 roundId, uint256 amount) external {
+    /// @notice 计算一笔竞猜下注的EIP-712签名摘要，供客户端统一签名格式。
+    /// @dev 绑定用户、轮次、猜测价格、金额、下注Nonce及Session代次。
+    function betDigest(address user, uint256 roundId, uint64 guess, uint256 amount, uint256 betNonce) public view returns (bytes32) {
+        bytes32 structHash = keccak256(abi.encode(
+            BET_TYPEHASH, user, roundId, guess, amount, betNonce, _sessions[user].generation
+        ));
+        return _typedDigest(structHash);
+    }
+
+    /// @notice 只读验证下注签名是否属于当前有效Session Key，且该Nonce尚未使用。
+    /// @dev 仅用于前端或RELAY预检查；不会占用Nonce，也不会扣减授权额度。
+    function verifyBet(address user, uint256 roundId, uint64 guess, uint256 amount,
+        uint256 betNonce, bytes calldata signature) external view returns (bool) {
+        Session storage s = _sessions[user];
+        if (user == address(0) || amount == 0 || s.key == address(0) || block.timestamp > s.expiry) return false;
+        if (isBetNonceUsed(user, betNonce)) return false;
+        return _recover(betDigest(user, roundId, guess, amount, betNonce), signature) == s.key;
+    }
+
+    /// @notice 竞猜合约验证下注后消费单笔下注Nonce及累计授权额度。
+    /// @dev 必须由竞猜合约调用；签名、Nonce和额度在同一笔链上交易中检查并更新。
+    function consumeBet(address user, uint256 roundId, uint64 guess, uint256 amount,
+        uint256 betNonce, bytes calldata signature) external {
         if (msg.sender != guessEngine) revert Unauthorized();
-        if (amount == 0) revert ZeroAmount();
-        if (roundCommitted[user][roundId]) revert AlreadyCommitted();
+        _consumeBet(user, roundId, guess, amount, betNonce, signature);
+    }
+
+    /// @notice 竞猜合约批量消费同一用户的多笔下注Nonce与额度。
+    /// @dev 批次全部成功或全部回滚；每笔均验证签名，批次过大时需按Gas上限拆分。
+    function consumeBetBatch(address user, uint256 roundId, uint64[] calldata guesses,
+        uint256[] calldata amounts, uint256[] calldata betNonces, bytes[] calldata signatures) external {
+        if (msg.sender != guessEngine) revert Unauthorized();
+        uint256 n = guesses.length;
+        if (n == 0 || n != amounts.length || n != betNonces.length || n != signatures.length) revert EmptyBatch();
+        for (uint256 i = 0; i < n; ++i) {
+            _consumeBet(user, roundId, guesses[i], amounts[i], betNonces[i], signatures[i]);
+        }
+    }
+
+    /// @notice 内部执行单笔下注的完整验证：身份、时效、签名、Nonce及授权额度。
+    /// @dev 先校验再标记Nonce；任何后续失败都会触发EVM交易原子回滚。
+    function _consumeBet(address user, uint256 roundId, uint64 guess, uint256 amount,
+        uint256 betNonce, bytes calldata signature) internal {
         Session storage s = _sessions[user];
         if (s.key == address(0) || block.timestamp > s.expiry) revert NoActiveSession();
-        if (amount > s.limit - s.spent) revert AllowanceExceeded();
+        if (amount == 0) revert ZeroAmount();
+        uint256 word = betNonce >> 8;
+        uint256 mask = uint256(1) << (betNonce & 255);
+        if ((_betNonceBitmap[user][word] & mask) != 0) revert BetNonceUsed();
+        bytes32 signatureDigest = betDigest(user, roundId, guess, amount, betNonce);
+        if (_recover(signatureDigest, signature) != s.key) revert InvalidSignature();
+        if (s.spent > s.limit || amount > s.limit - s.spent) revert AllowanceExceeded();
+        _betNonceBitmap[user][word] |= mask;
         s.spent += amount;
-        roundCommitted[user][roundId] = true;
-        emit AllowanceConsumed(user, s.key, roundId, amount, s.spent);
+        emit BetConsumed(user, s.key, roundId, betNonce, amount, s.spent);
     }
 
     /// @notice 从 65 字节 ECDSA 签名恢复签名者地址，无效签名返回零地址。
